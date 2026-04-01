@@ -9,6 +9,7 @@ import re
 import threading
 import zipfile
 import base64
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -2018,6 +2019,142 @@ def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
 async def batch_validate_tokens(request: BatchValidateRequest):
     """批量验证账号 Token 有效性"""
     return _run_batch_validate_tokens(request)
+
+
+def _execute_account_validate_async_task(task_id: str, request: BatchValidateRequest) -> None:
+    acquired = False
+    try:
+        while True:
+            acquired, running, quota = task_manager.try_acquire_domain_slot("accounts", task_id)
+            if acquired:
+                break
+
+            if task_manager.is_domain_task_cancel_requested("accounts", task_id):
+                task_manager.update_domain_task(
+                    "accounts",
+                    task_id,
+                    status="cancelled",
+                    message="任务已取消",
+                    finished_at=utcnow_naive().isoformat(),
+                )
+                return
+
+            task_manager.update_domain_task(
+                "accounts",
+                task_id,
+                status="pending",
+                message=f"等待可用执行槽位（{running}/{quota}）",
+            )
+            import time
+            time.sleep(0.3)
+
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="running",
+            message="正在批量验证账号 Token",
+        )
+
+        result = _run_batch_validate_tokens(request)
+        details = list(result.get("details") or [])
+        total = len(details)
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="completed",
+            message=f"批量验证完成，共处理 {total} 个账号",
+            finished_at=utcnow_naive().isoformat(),
+            result=result,
+            details=details,
+            progress={
+                "total": total,
+                "completed": total,
+                "valid_count": int(result.get("valid_count") or 0),
+                "invalid_count": int(result.get("invalid_count") or 0),
+            },
+        )
+    except Exception as exc:
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="failed",
+            message=f"批量验证失败: {exc}",
+            error=str(exc),
+            finished_at=utcnow_naive().isoformat(),
+        )
+    finally:
+        if acquired:
+            task_manager.release_domain_slot("accounts", task_id)
+
+
+@router.post("/batch-validate/async")
+async def batch_validate_tokens_async(request: BatchValidateRequest):
+    """创建批量验证异步任务。"""
+    task_id = str(uuid.uuid4())
+    task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="batch_validate",
+        payload=request.model_dump(),
+        progress={"total": 0, "completed": 0, "valid_count": 0, "invalid_count": 0},
+    )
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _execute_account_validate_async_task, task_id, request)
+    task = task_manager.get_domain_task("accounts", task_id)
+    return task or {"id": task_id, "domain": "accounts", "status": "pending"}
+
+
+@router.get("/tasks/{task_id}")
+async def get_account_async_task(task_id: str):
+    """读取账号域异步任务详情。"""
+    task = task_manager.get_domain_task("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+def cancel_account_async_task(task_id: str):
+    task = task_manager.request_domain_task_cancel("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def pause_account_async_task(task_id: str):
+    task = task_manager.request_domain_task_pause("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def resume_account_async_task(task_id: str):
+    task = task_manager.request_domain_task_resume("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def retry_account_async_task(task_id: str):
+    task = task_manager.get_domain_task("accounts", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    payload = dict(task.get("payload") or {})
+    request = BatchValidateRequest.model_validate(payload)
+    new_task_id = str(uuid.uuid4())
+    task_manager.register_domain_task(
+        domain="accounts",
+        task_id=new_task_id,
+        task_type="batch_validate",
+        payload=request.model_dump(),
+        progress={"total": 0, "completed": 0, "valid_count": 0, "invalid_count": 0},
+    )
+    loop = task_manager.get_loop()
+    if loop and loop.is_running():
+        loop.run_in_executor(None, _execute_account_validate_async_task, new_task_id, request)
+    else:
+        raise HTTPException(status_code=503, detail="任务系统未就绪")
+    created = task_manager.get_domain_task("accounts", new_task_id)
+    return created or {"id": new_task_id, "domain": "accounts", "status": "pending"}
 
 
 def run_quick_refresh_workflow(source: str = "manual") -> Dict[str, Any]:

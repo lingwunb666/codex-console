@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import uuid
+import asyncio
 from typing import Optional, List
 from datetime import datetime
 import time
@@ -36,6 +37,7 @@ from ...core.openai.browser_bind import auto_bind_checkout_with_playwright
 from ...core.openai.random_billing import generate_random_billing_profile
 from ...core.openai.token_refresh import TokenRefreshManager
 from ...core.dynamic_proxy import get_proxy_url_for_task
+from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -3320,6 +3322,141 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
                 )
 
     return results
+
+
+def _execute_payment_subscription_async_task(task_id: str, request: BatchCheckSubscriptionRequest) -> None:
+    acquired = False
+    try:
+        while True:
+            acquired, running, quota = task_manager.try_acquire_domain_slot("payment", task_id)
+            if acquired:
+                break
+
+            if task_manager.is_domain_task_cancel_requested("payment", task_id):
+                task_manager.update_domain_task(
+                    "payment",
+                    task_id,
+                    status="cancelled",
+                    message="任务已取消",
+                    finished_at=utcnow_naive().isoformat(),
+                )
+                return
+
+            task_manager.update_domain_task(
+                "payment",
+                task_id,
+                status="pending",
+                message=f"等待可用执行槽位（{running}/{quota}）",
+            )
+            time.sleep(0.3)
+
+        task_manager.update_domain_task(
+            "payment",
+            task_id,
+            status="running",
+            message="正在批量检测账号订阅",
+        )
+
+        result = batch_check_subscription(request)
+        details = list(result.get("details") or [])
+        total = len(details)
+        task_manager.update_domain_task(
+            "payment",
+            task_id,
+            status="completed",
+            message=f"批量检测订阅完成，共处理 {total} 个账号",
+            finished_at=utcnow_naive().isoformat(),
+            result=result,
+            details=details,
+            progress={
+                "total": total,
+                "completed": total,
+                "success_count": int(result.get("success_count") or 0),
+                "failed_count": int(result.get("failed_count") or 0),
+            },
+        )
+    except Exception as exc:
+        task_manager.update_domain_task(
+            "payment",
+            task_id,
+            status="failed",
+            message=f"批量检测订阅失败: {exc}",
+            error=str(exc),
+            finished_at=utcnow_naive().isoformat(),
+        )
+    finally:
+        if acquired:
+            task_manager.release_domain_slot("payment", task_id)
+
+
+@router.post("/accounts/batch-check-subscription/async")
+async def batch_check_subscription_async(request: BatchCheckSubscriptionRequest):
+    """创建批量检测订阅异步任务。"""
+    task_id = str(uuid.uuid4())
+    task_manager.register_domain_task(
+        domain="payment",
+        task_id=task_id,
+        task_type="batch_check_subscription",
+        payload=request.model_dump(),
+        progress={"total": 0, "completed": 0, "success_count": 0, "failed_count": 0},
+    )
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _execute_payment_subscription_async_task, task_id, request)
+    task = task_manager.get_domain_task("payment", task_id)
+    return task or {"id": task_id, "domain": "payment", "status": "pending"}
+
+
+@router.get("/ops/tasks/{task_id}")
+def get_payment_op_task(task_id: str):
+    """读取支付域异步任务详情。"""
+    task = task_manager.get_domain_task("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+def cancel_payment_op_task(task_id: str):
+    task = task_manager.request_domain_task_cancel("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def pause_payment_op_task(task_id: str):
+    task = task_manager.request_domain_task_pause("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def resume_payment_op_task(task_id: str):
+    task = task_manager.request_domain_task_resume("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task": task, "status": task.get("status")}
+
+
+def retry_payment_op_task(task_id: str):
+    task = task_manager.get_domain_task("payment", task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    payload = dict(task.get("payload") or {})
+    request = BatchCheckSubscriptionRequest.model_validate(payload)
+    new_task_id = str(uuid.uuid4())
+    task_manager.register_domain_task(
+        domain="payment",
+        task_id=new_task_id,
+        task_type="batch_check_subscription",
+        payload=request.model_dump(),
+        progress={"total": 0, "completed": 0, "success_count": 0, "failed_count": 0},
+    )
+    loop = task_manager.get_loop()
+    if loop and loop.is_running():
+        loop.run_in_executor(None, _execute_payment_subscription_async_task, new_task_id, request)
+    else:
+        raise HTTPException(status_code=503, detail="任务系统未就绪")
+    created = task_manager.get_domain_task("payment", new_task_id)
+    return created or {"id": new_task_id, "domain": "payment", "status": "pending"}
 
 
 @router.post("/accounts/{account_id}/mark-subscription")
