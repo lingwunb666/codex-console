@@ -8,6 +8,9 @@ import re
 import sys
 import threading
 import time
+import asyncio
+import inspect
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -359,6 +362,25 @@ class LuckMailService(BaseEmailService):
             except Exception as exc:
                 logger.warning(f"LuckMail 写入状态文件失败: {path} - {exc}")
 
+    def _resolve_sdk_result(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(asyncio.run, value)
+                    return future.result()
+
+            return asyncio.run(value)
+        return value
+
+    def _call_user_api(self, method_name: str, **kwargs) -> Any:
+        method = getattr(self.client.user, method_name)
+        return self._resolve_sdk_result(method(**kwargs))
+
     def _mark_registered_email(self, email: str, extra: Optional[Dict[str, Any]] = None) -> None:
         email_norm = self._normalize_email(email)
         if not email_norm:
@@ -473,7 +495,7 @@ class LuckMailService(BaseEmailService):
             return None
         try:
             for page in range(1, max_pages + 1):
-                result = self.client.user.get_orders(page=page, page_size=page_size)
+                result = self._call_user_api("get_orders", page=page, page_size=page_size)
                 items = list(getattr(result, "list", []) or [])
                 if not items:
                     break
@@ -654,11 +676,12 @@ class LuckMailService(BaseEmailService):
     def _iter_purchase_items(self, scan_pages: int, page_size: int):
         for page in range(1, scan_pages + 1):
             try:
-                page_result = self.client.user.get_purchases(
-                    page=page,
-                    page_size=page_size,
-                    user_disabled=0,
-                )
+                 page_result = self._call_user_api(
+                     "get_purchases",
+                     page=page,
+                     page_size=page_size,
+                     user_disabled=0,
+                 )
             except Exception as exc:
                 logger.warning(f"LuckMail 拉取已购邮箱失败: page={page}, error={exc}")
                 break
@@ -708,6 +731,141 @@ class LuckMailService(BaseEmailService):
             "expired_at": "",
             "created_at": time.time(),
             "source": source,
+        }
+
+    async def list_purchased_mailboxes_async(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        project_id: Optional[int] = None,
+        tag_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+        user_disabled: int = 0,
+    ) -> Dict[str, Any]:
+        safe_page = max(int(page or 1), 1)
+        safe_page_size = max(min(int(page_size or 20), 200), 1)
+        kwargs: Dict[str, Any] = {
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "user_disabled": int(user_disabled or 0),
+        }
+        if project_id is not None:
+            kwargs["project_id"] = int(project_id)
+        if tag_id is not None:
+            kwargs["tag_id"] = int(tag_id)
+        if keyword:
+            kwargs["keyword"] = str(keyword).strip()
+
+        try:
+            method = getattr(self.client.user, "get_purchases")
+            result = method(**kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            else:
+                result = self._resolve_sdk_result(result)
+        except Exception as exc:
+            self.update_status(False, exc)
+            raise EmailServiceError(f"LuckMail 拉取已购邮箱列表失败: {exc}")
+
+        items = list(getattr(result, "list", []) or [])
+        total = int(getattr(result, "total", len(items)) or len(items))
+        current_page = int(getattr(result, "page", safe_page) or safe_page)
+        current_page_size = int(getattr(result, "page_size", safe_page_size) or safe_page_size)
+
+        normalized_items: List[Dict[str, Any]] = []
+        for item in items:
+            info = self._build_purchase_order_info(
+                item=item,
+                project_code=str(self.config.get("project_code") or "").strip(),
+                email_type=str(self.config.get("email_type") or "").strip(),
+                preferred_domain="",
+                source="purchased_list",
+            )
+            if not info:
+                continue
+            normalized_items.append(
+                {
+                    "id": info.get("purchase_id") or info.get("id") or info.get("service_id"),
+                    "email": info.get("email"),
+                    "email_address": info.get("email"),
+                    "token": info.get("token"),
+                    "purchase_id": info.get("purchase_id"),
+                    "service_id": info.get("service_id"),
+                    "project_name": self._extract_field(item, "project_name", "project") or "",
+                    "price": str(self._extract_field(item, "price") or "").strip(),
+                    "status": self._extract_field(item, "status"),
+                    "tag_id": self._extract_field(item, "tag_id"),
+                    "tag_name": self._extract_field(item, "tag_name") or "",
+                    "user_disabled": int(self._extract_field(item, "user_disabled") or 0),
+                    "warranty_hours": self._extract_field(item, "warranty_hours"),
+                    "warranty_until": self._extract_field(item, "warranty_until") or "",
+                    "created_at": self._extract_field(item, "created_at") or "",
+                    "source": info.get("source"),
+                }
+            )
+
+        self.update_status(True)
+        return {
+            "list": normalized_items,
+            "total": total,
+            "page": current_page,
+            "page_size": current_page_size,
+        }
+
+    def list_purchased_mailboxes(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        project_id: Optional[int] = None,
+        tag_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+        user_disabled: int = 0,
+    ) -> Dict[str, Any]:
+        return self._resolve_sdk_result(
+            self.list_purchased_mailboxes_async(
+                page=page,
+                page_size=page_size,
+                project_id=project_id,
+                tag_id=tag_id,
+                keyword=keyword,
+                user_disabled=user_disabled,
+            )
+        )
+
+    def build_selected_purchase_order_info(
+        self,
+        *,
+        token: str,
+        email: Optional[str] = None,
+        purchase_id: Optional[str] = None,
+        project_code: Optional[str] = None,
+        email_type: Optional[str] = None,
+        preferred_domain: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        token_text = str(token or "").strip()
+        email_text = self._normalize_email(email)
+        purchase_id_text = str(purchase_id or "").strip() or None
+        if not token_text:
+            raise EmailServiceError("LuckMail 已购邮箱 token 不能为空")
+        if not email_text:
+            raise EmailServiceError("LuckMail 已购邮箱地址不能为空")
+
+        return {
+            "id": purchase_id_text or token_text,
+            "service_id": token_text,
+            "order_no": "",
+            "email": email_text,
+            "token": token_text,
+            "purchase_id": purchase_id_text,
+            "inbox_mode": "purchase",
+            "project_code": str(project_code or self.config.get("project_code") or "").strip(),
+            "email_type": str(email_type or self.config.get("email_type") or "").strip(),
+            "preferred_domain": str(preferred_domain or self.config.get("preferred_domain") or "").strip().lstrip("@"),
+            "expired_at": "",
+            "created_at": time.time(),
+            "source": "selected_purchase",
         }
 
     def _pick_reusable_purchase_inbox(
@@ -909,6 +1067,41 @@ class LuckMailService(BaseEmailService):
         inbox_mode = self._normalize_inbox_mode(
             request_config.get("inbox_mode") or request_config.get("mode") or self.config.get("inbox_mode")
         )
+
+        selected_token = str(
+            request_config.get("selected_mailbox_token")
+            or request_config.get("token")
+            or self.config.get("selected_mailbox_token")
+            or self.config.get("token")
+            or ""
+        ).strip()
+        selected_email = self._normalize_email(
+            request_config.get("selected_mailbox_email")
+            or request_config.get("email")
+            or self.config.get("selected_mailbox_email")
+            or self.config.get("email")
+            or ""
+        )
+        selected_purchase_id = str(
+            request_config.get("selected_purchase_id")
+            or request_config.get("purchase_id")
+            or self.config.get("selected_purchase_id")
+            or self.config.get("purchase_id")
+            or ""
+        ).strip() or None
+
+        if selected_token:
+            order_info = self.build_selected_purchase_order_info(
+                token=selected_token,
+                email=selected_email,
+                purchase_id=selected_purchase_id,
+                project_code=project_code,
+                email_type=email_type,
+                preferred_domain=preferred_domain,
+            )
+            self._cache_order(order_info)
+            self.update_status(True)
+            return order_info
 
         if inbox_mode == "order":
             order_info = self._create_order_inbox(

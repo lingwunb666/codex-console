@@ -16,6 +16,8 @@ let isBatchMode = false;
 let isOutlookBatchMode = false;
 let isAutoMode = false;
 let outlookAccounts = [];
+let luckmailPurchases = [];
+let selectedLuckMailPurchaseTokens = new Set();
 let editingScheduleJobUuid = null;
 let scheduledJobs = [];
 let taskCompleted = false;  // 标记任务是否已完成
@@ -104,6 +106,9 @@ const elements = {
     // Outlook 批量注册
     outlookBatchSection: document.getElementById('outlook-batch-section'),
     outlookAccountsContainer: document.getElementById('outlook-accounts-container'),
+    luckmailPurchasesSection: document.getElementById('luckmail-purchases-section'),
+    luckmailPurchasesContainer: document.getElementById('luckmail-purchases-container'),
+    luckmailUseAllPurchases: document.getElementById('luckmail-use-all-purchases'),
     outlookIntervalMin: document.getElementById('outlook-interval-min'),
     outlookIntervalMax: document.getElementById('outlook-interval-max'),
     outlookSkipRegistered: document.getElementById('outlook-skip-registered'),
@@ -539,10 +544,14 @@ function handleServiceChange(e) {
     if (!value) return;
 
     const [type, id] = value.split(':');
+    selectedLuckMailPurchase = null;
     // 处理 Outlook 批量注册模式
     if (type === 'outlook_batch') {
         isOutlookBatchMode = true;
         elements.outlookBatchSection.style.display = 'block';
+        if (elements.luckmailPurchasesSection) {
+            elements.luckmailPurchasesSection.style.display = 'none';
+        }
         elements.regModeGroup.style.display = 'none';
         elements.batchCountGroup.style.display = 'none';
         elements.batchOptions.style.display = 'none';
@@ -553,6 +562,14 @@ function handleServiceChange(e) {
         isOutlookBatchMode = false;
         elements.outlookBatchSection.style.display = 'none';
         elements.regModeGroup.style.display = 'block';
+    }
+
+    if (elements.luckmailPurchasesSection) {
+        elements.luckmailPurchasesSection.style.display = type === 'luckmail' ? 'block' : 'none';
+    }
+    if (type !== 'luckmail') {
+        luckmailPurchases = [];
+        renderLuckMailPurchases();
     }
 
     // 显示服务信息
@@ -590,6 +607,7 @@ function handleServiceChange(e) {
         const service = availableServices.luckmail.services.find(s => s.id == id);
         if (service) {
             addLog('info', `[系统] 已选择 LuckMail 服务: ${service.name}`);
+            loadLuckMailPurchases(id);
         }
     } else if (type === 'freemail') {
         const service = availableServices.freemail.services.find(s => s.id == id);
@@ -705,6 +723,36 @@ function buildCurrentRegistrationConfig() {
         baseConfig.email_service_id = parseInt(serviceId);
     }
 
+    const selectedLuckMailPurchases = getSelectedLuckMailPurchases();
+    const useAllLuckMailPurchases = !!(elements.luckmailUseAllPurchases && elements.luckmailUseAllPurchases.checked);
+    if (emailServiceType === 'luckmail' && selectedLuckMailPurchases.length === 1 && !useAllLuckMailPurchases) {
+        const selectedLuckMailPurchase = selectedLuckMailPurchases[0];
+        baseConfig.email_service_config = {
+            selected_mailbox_token: selectedLuckMailPurchase.token,
+            selected_mailbox_email: selectedLuckMailPurchase.email || selectedLuckMailPurchase.email_address,
+            selected_purchase_id: selectedLuckMailPurchase.purchase_id || selectedLuckMailPurchase.id || null,
+            inbox_mode: 'purchase',
+        };
+    }
+
+    if (emailServiceType === 'luckmail' && (useAllLuckMailPurchases || selectedLuckMailPurchases.length > 1)) {
+        return {
+            ...baseConfig,
+            reg_mode: 'luckmail_batch',
+            use_all_purchased: useAllLuckMailPurchases,
+            skip_registered: true,
+            selected_mailboxes: selectedLuckMailPurchases.map(item => ({
+                email: item.email || item.email_address,
+                token: item.token,
+                purchase_id: item.purchase_id || item.id || null,
+            })),
+            interval_min: parseInt(elements.intervalMin.value) || 5,
+            interval_max: parseInt(elements.intervalMax.value) || 30,
+            concurrency: Math.min(50, Math.max(1, parseInt(elements.concurrencyCount.value) || 1)),
+            mode: elements.concurrencyMode.value || 'pipeline',
+        };
+    }
+
     if (isBatchMode) {
         return {
             ...baseConfig,
@@ -718,6 +766,119 @@ function buildCurrentRegistrationConfig() {
 
     return baseConfig;
 }
+
+async function loadLuckMailPurchases(serviceId) {
+    const numericServiceId = parseInt(serviceId, 10);
+    if (!elements.luckmailPurchasesContainer || !Number.isFinite(numericServiceId) || numericServiceId <= 0) {
+        return;
+    }
+
+    elements.luckmailPurchasesContainer.innerHTML = `
+        <div class="loading-placeholder" style="text-align: center; padding: var(--spacing-md); color: var(--text-muted);">
+            正在加载已购邮箱...
+        </div>`;
+
+    try {
+        const data = await api.get(`/registration/luckmail-purchases?service_id=${numericServiceId}&page=1&page_size=50&user_disabled=0`);
+        luckmailPurchases = Array.isArray(data.mailboxes) ? data.mailboxes : [];
+        selectedLuckMailPurchaseTokens = new Set(
+            Array.from(selectedLuckMailPurchaseTokens).filter(token => luckmailPurchases.some(item => item.token === token))
+        );
+        renderLuckMailPurchases();
+        addLog('info', `[系统] LuckMail 已购邮箱已加载，共 ${luckmailPurchases.length} 条`);
+    } catch (error) {
+        luckmailPurchases = [];
+        selectedLuckMailPurchaseTokens = new Set();
+        elements.luckmailPurchasesContainer.innerHTML = `
+            <div class="loading-placeholder" style="text-align: center; padding: var(--spacing-md); color: var(--danger-color, #d32f2f);">
+                加载失败：${escapeHtml(error.message || '未知错误')}
+            </div>`;
+        addLog('warning', `[警告] LuckMail 已购邮箱加载失败: ${error.message}`);
+    }
+}
+
+function renderLuckMailPurchases() {
+    if (!elements.luckmailPurchasesContainer) return;
+    if (!luckmailPurchases.length) {
+        elements.luckmailPurchasesContainer.innerHTML = `
+            <div class="loading-placeholder" style="text-align: center; padding: var(--spacing-md); color: var(--text-muted);">
+                暂无已购邮箱
+            </div>`;
+        return;
+    }
+
+    elements.luckmailPurchasesContainer.innerHTML = luckmailPurchases.map((item, index) => {
+        const checked = selectedLuckMailPurchaseTokens.has(item.token);
+        const email = escapeHtml(item.email || item.email_address || '');
+        const projectName = escapeHtml(item.project_name || '-');
+        const tagName = escapeHtml(item.tag_name || '-');
+        const createdAt = escapeHtml(item.created_at || '-');
+        return `
+            <label style="display:block; padding: 8px 10px; border-radius: var(--radius); border: 1px solid var(--border-light); margin-bottom: 8px; cursor: pointer; background:${checked ? 'rgba(25,118,210,0.08)' : 'transparent'};">
+                <div style="display:flex; align-items:flex-start; gap:8px;">
+                    <input type="checkbox" name="luckmail-purchase" class="luckmail-purchase-checkbox" value="${escapeHtml(item.token || '')}" data-index="${index}" ${checked ? 'checked' : ''}>
+                    <div style="flex:1; min-width:0;">
+                        <div style="font-weight:600; word-break:break-all;">${email}</div>
+                        <div style="color: var(--text-muted); font-size: 12px; margin-top: 4px;">项目：${projectName} · 标签：${tagName}</div>
+                        <div style="color: var(--text-muted); font-size: 12px; margin-top: 2px;">创建时间：${createdAt}</div>
+                    </div>
+                </div>
+            </label>`;
+    }).join('');
+
+    elements.luckmailPurchasesContainer.querySelectorAll('.luckmail-purchase-checkbox').forEach(radio => {
+        radio.addEventListener('change', (event) => {
+            const idx = parseInt(event.target.dataset.index, 10);
+            const mailbox = Number.isFinite(idx) ? (luckmailPurchases[idx] || null) : null;
+            if (!mailbox) return;
+            if (event.target.checked) {
+                selectedLuckMailPurchaseTokens.add(mailbox.token);
+            } else {
+                selectedLuckMailPurchaseTokens.delete(mailbox.token);
+            }
+            renderLuckMailPurchases();
+            addLog('info', `[系统] 已${event.target.checked ? '选择' : '取消'} LuckMail 已购邮箱: ${mailbox.email || mailbox.email_address}`);
+        });
+    });
+}
+
+function getSelectedLuckMailPurchases() {
+    return luckmailPurchases.filter(item => selectedLuckMailPurchaseTokens.has(item.token));
+}
+
+async function refreshLuckMailPurchases() {
+    const selectedValue = elements.emailService.value || '';
+    const [type, id] = selectedValue.split(':');
+    if (type !== 'luckmail' || !id) {
+        toast.warning('请先选择一个 LuckMail 服务');
+        return;
+    }
+    await loadLuckMailPurchases(id);
+}
+
+function selectFirstLuckMailPurchase() {
+    if (!luckmailPurchases.length) {
+        toast.warning('暂无可选的 LuckMail 已购邮箱');
+        return;
+    }
+    selectedLuckMailPurchaseTokens = new Set([luckmailPurchases[0].token]);
+    renderLuckMailPurchases();
+}
+
+function clearLuckMailPurchaseSelection() {
+    selectedLuckMailPurchaseTokens = new Set();
+    renderLuckMailPurchases();
+}
+
+function selectAllLuckMailPurchases() {
+    selectedLuckMailPurchaseTokens = new Set(luckmailPurchases.map(item => item.token));
+    renderLuckMailPurchases();
+}
+
+window.refreshLuckMailPurchases = refreshLuckMailPurchases;
+window.selectFirstLuckMailPurchase = selectFirstLuckMailPurchase;
+window.clearLuckMailPurchaseSelection = clearLuckMailPurchaseSelection;
+window.selectAllLuckMailPurchases = selectAllLuckMailPurchases;
 
 function buildScheduleConfig() {
     const triggerType = elements.scheduleTriggerType.value;
@@ -1021,6 +1182,11 @@ async function handleStartRegistration(e) {
 
     const requestData = buildCurrentRegistrationConfig();
 
+    if (requestData && requestData.reg_mode === 'luckmail_batch') {
+        await handleLuckMailBatchRegistration(requestData);
+        return;
+    }
+
     if (isBatchMode) {
         await handleBatchRegistration(requestData);
     } else {
@@ -1188,6 +1354,43 @@ async function handleSingleRegistration(requestData) {
         // 优先使用 WebSocket
         connectWebSocket(data.task_uuid);
 
+    } catch (error) {
+        addLog('error', `[错误] 启动失败: ${error.message}`);
+        toast.error(error.message);
+        resetButtons();
+    }
+}
+
+
+async function handleLuckMailBatchRegistration(requestData) {
+    batchCompleted = false;
+    batchFinalStatus = null;
+    displayedLogs.clear();
+    toastShown = false;
+
+    addLog('info', '[系统] 正在启动 LuckMail 批量注册任务...');
+
+    try {
+        const payload = {
+            ...requestData,
+            service_id: requestData.service_id || requestData.email_service_id,
+        };
+        const data = await api.post('/registration/luckmail-batch', payload);
+
+        if (!data.batch_id) {
+            addLog('warning', '[警告] 所有选中的 LuckMail 邮箱都已注册，无需重复注册');
+            toast.warning('所有选中的 LuckMail 邮箱都已注册');
+            resetButtons();
+            return;
+        }
+
+        currentBatch = { batch_id: data.batch_id, ...data, pollingMode: 'batch' };
+        activeBatchId = data.batch_id;
+        sessionStorage.setItem('activeTask', JSON.stringify({ batch_id: data.batch_id, mode: 'batch', total: data.to_register || data.total || 0 }));
+        addLog('info', `[系统] 批量任务已创建: ${data.batch_id}`);
+        addLog('info', `[系统] 总数: ${data.total}, 跳过已注册: ${data.skipped}, 待注册: ${data.to_register}`);
+        showBatchStatus({ count: data.to_register || data.total || 0 });
+        connectBatchWebSocket(data.batch_id);
     } catch (error) {
         addLog('error', `[错误] 启动失败: ${error.message}`);
         toast.error(error.message);
