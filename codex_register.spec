@@ -3,7 +3,19 @@
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
 block_cipher = None
+
+luckmail_hiddenimports = []
+luckmail_datas = []
+
+try:
+    luckmail_hiddenimports = collect_submodules('luckmail')
+    luckmail_datas = collect_data_files('luckmail')
+except Exception:
+    luckmail_hiddenimports = []
+    luckmail_datas = []
 
 a = Analysis(
     ['webui.py'],
@@ -13,7 +25,7 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('src', 'src'),
-    ],
+    ] + luckmail_datas,
     hiddenimports=[
         'uvicorn.logging',
         'uvicorn.loops',
@@ -109,7 +121,7 @@ a = Analysis(
         'src.web.routes.settings',
         'src.web.routes.websocket',
         'src.web.task_manager',
-    ],
+    ] + luckmail_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -22,35 +22,88 @@ _STATE_LOCK = threading.RLock()
 LUCKMAIL_APPEAL_ENABLED = False
 
 
+def _iter_luckmail_search_roots() -> List[Path]:
+    """返回 LuckMail 可能存在的根目录（目录内应包含 luckmail 包目录）。"""
+    roots: List[Path] = []
+
+    current_file = Path(__file__).resolve()
+    roots.extend(
+        [
+            current_file.parents[2],
+            current_file.parents[3],
+            current_file.parents[3] / "tools",
+        ]
+    )
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        roots.extend(
+            [
+                exe_dir,
+                exe_dir / "tools",
+                exe_dir.parent,
+                exe_dir.parent / "tools",
+            ]
+        )
+
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            meipass_path = Path(meipass).resolve()
+            roots.extend(
+                [
+                    meipass_path,
+                    meipass_path / "tools",
+                ]
+            )
+
+    unique_roots: List[Path] = []
+    seen: Set[str] = set()
+    for root in roots:
+        try:
+            root_key = str(root.resolve()).lower()
+        except Exception:
+            root_key = str(root).lower()
+        if root_key in seen:
+            continue
+        seen.add(root_key)
+        unique_roots.append(root)
+    return unique_roots
+
+
 def _load_luckmail_client_class():
     """
     兼容两种来源：
     1) 环境已安装 luckmail 包
-    2) 本地 vendored 目录（优先 codex-console/luckmail，其次 ../tools/luckmail）
+    2) 本地 vendored 目录（源码运行 / 打包 exe 均支持）
     """
     try:
         from luckmail import LuckMailClient  # type: ignore
 
         return LuckMailClient
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("LuckMail import from installed environment failed: %s", exc)
 
-    candidates = [
-        Path(__file__).resolve().parents[2] / "luckmail",
-        Path(__file__).resolve().parents[3] / "tools" / "luckmail",
-    ]
-    for path in candidates:
-        if not path.is_dir():
+    for root in _iter_luckmail_search_roots():
+        package_dir = root / "luckmail"
+        if not package_dir.is_dir():
             continue
-        path_str = str(path)
-        if path_str not in sys.path:
-            sys.path.insert(0, path_str)
+
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+
         try:
             from luckmail import LuckMailClient  # type: ignore
 
             return LuckMailClient
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "LuckMail import failed from vendored path %s: %s",
+                package_dir,
+                exc,
+            )
             continue
+
     return None
 
 
@@ -102,7 +155,7 @@ class LuckMailService(BaseEmailService):
         client_cls = _load_luckmail_client_class()
         if client_cls is None:
             raise ValueError(
-                "未找到 LuckMail SDK，请先安装 luckmail 包或确保本地存在 tools/luckmail"
+                "未找到 LuckMail SDK，请先安装 luckmail 包，或将 luckmail 源码目录放到程序同级目录/同级 tools 目录后重试"
             )
 
         try:
