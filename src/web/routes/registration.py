@@ -214,6 +214,68 @@ class OutlookBatchRegistrationResponse(BaseModel):
     service_ids: List[int]       # 实际要注册的服务 ID
 
 
+class LuckMailPurchasedMailbox(BaseModel):
+    id: Optional[str] = None
+    email: str
+    email_address: str
+    token: str
+    purchase_id: Optional[str] = None
+    service_id: str
+    project_name: Optional[str] = None
+    price: Optional[str] = None
+    status: Optional[int] = None
+    tag_id: Optional[int] = None
+    tag_name: Optional[str] = None
+    user_disabled: int = 0
+    warranty_hours: Optional[int] = None
+    warranty_until: Optional[str] = None
+    created_at: Optional[str] = None
+    source: Optional[str] = None
+
+
+class LuckMailPurchasedMailboxListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    mailboxes: List[LuckMailPurchasedMailbox]
+
+
+class LuckMailSelectedMailbox(BaseModel):
+    email: str
+    token: str
+    purchase_id: Optional[str] = None
+
+
+class LuckMailBatchRegistrationRequest(BaseModel):
+    service_id: int = Field(validation_alias='email_service_id')
+    selected_mailboxes: List[LuckMailSelectedMailbox] = []
+    use_all_purchased: bool = False
+    skip_registered: bool = True
+    proxy: Optional[str] = None
+    interval_min: int = 5
+    interval_max: int = 30
+    concurrency: int = 1
+    mode: str = "pipeline"
+    auto_upload_cpa: bool = False
+    cpa_service_ids: List[int] = []
+    auto_upload_sub2api: bool = False
+    sub2api_service_ids: List[int] = []
+    auto_upload_tm: bool = False
+    tm_service_ids: List[int] = []
+    auto_upload_new_api: bool = False
+    new_api_service_ids: List[int] = []
+    registration_type: str = RoleTag.CHILD.value
+
+
+class LuckMailBatchRegistrationResponse(BaseModel):
+    batch_id: str
+    total: int
+    skipped: int
+    to_register: int
+    service_id: int
+    selected_count: int
+
+
 class ScheduledRegistrationRequest(BaseModel):
     """创建或更新计划注册任务请求"""
     name: str = Field(..., min_length=1, max_length=100)
@@ -332,11 +394,35 @@ def _normalize_email_service_config(
     elif service_type == EmailServiceType.LUCKMAIL:
         if 'domain' in normalized and 'preferred_domain' not in normalized:
             normalized['preferred_domain'] = normalized.pop('domain')
+        selected_token = str(normalized.get('selected_mailbox_token') or normalized.get('token') or '').strip()
+        if selected_token:
+            normalized['selected_mailbox_token'] = selected_token
+            normalized['token'] = selected_token
+            normalized['inbox_mode'] = 'purchase'
+        selected_email = str(normalized.get('selected_mailbox_email') or normalized.get('email') or '').strip().lower()
+        if selected_email:
+            normalized['selected_mailbox_email'] = selected_email
+            normalized['email'] = selected_email
+        selected_purchase_id = str(normalized.get('selected_purchase_id') or normalized.get('purchase_id') or '').strip()
+        if selected_purchase_id:
+            normalized['selected_purchase_id'] = selected_purchase_id
+            normalized['purchase_id'] = selected_purchase_id
 
     if proxy_url and 'proxy_url' not in normalized:
         normalized['proxy_url'] = proxy_url
 
     return normalized
+
+
+def _merge_email_service_config(base: Optional[dict], overrides: Optional[dict]) -> dict:
+    merged = dict(base or {})
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str) and value == '':
+            continue
+        merged[key] = value
+    return merged
 
 
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_new_api: bool = False, new_api_service_ids: List[int] = None, registration_type: str = RoleTag.CHILD.value):
@@ -395,6 +481,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 if db_service:
                     service_type = EmailServiceType(db_service.service_type)
                     config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                    if email_service_config:
+                        request_config = _normalize_email_service_config(service_type, email_service_config, actual_proxy_url)
+                        config = _merge_email_service_config(config, request_config)
+                        if service_type == EmailServiceType.LUCKMAIL and request_config.get("selected_mailbox_token"):
+                            logger.info("LuckMail 批量任务使用每任务指定的已购邮箱 token")
                     # 更新任务关联的邮箱服务
                     crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                     logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id}, 类型: {service_type.value})")
@@ -555,19 +646,24 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 elif service_type == EmailServiceType.LUCKMAIL:
                     from ...database.models import EmailService as EmailServiceModel
 
-                    db_service = db.query(EmailServiceModel).filter(
-                        EmailServiceModel.service_type == "luckmail",
-                        EmailServiceModel.enabled == True
-                    ).order_by(EmailServiceModel.priority.asc()).first()
-
-                    if db_service and db_service.config:
-                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
-                        crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
-                        logger.info(f"使用数据库 LuckMail 服务: {db_service.name}")
+                    request_luckmail_config = _normalize_email_service_config(service_type, email_service_config or {}, actual_proxy_url)
+                    if request_luckmail_config.get("api_key") or request_luckmail_config.get("selected_mailbox_token"):
+                        config = request_luckmail_config
+                        logger.info("使用请求指定的 LuckMail 配置")
                     else:
-                        config = _normalize_email_service_config(service_type, email_service_config or {}, actual_proxy_url)
-                        if not config.get("api_key"):
-                            raise ValueError("没有可用的 LuckMail 服务，请先在邮箱服务中添加并填写 API Key")
+                        db_service = db.query(EmailServiceModel).filter(
+                            EmailServiceModel.service_type == "luckmail",
+                            EmailServiceModel.enabled == True
+                        ).order_by(EmailServiceModel.priority.asc()).first()
+
+                        if db_service and db_service.config:
+                            config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                            crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
+                            logger.info(f"使用数据库 LuckMail 服务: {db_service.name}")
+                        else:
+                            config = request_luckmail_config
+                            if not config.get("api_key"):
+                                raise ValueError("没有可用的 LuckMail 服务，请先在邮箱服务中添加并填写 API Key")
                 else:
                     config = email_service_config or {}
 
@@ -879,6 +975,7 @@ async def run_batch_parallel(
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
     registration_type: str = RoleTag.CHILD.value,
+    per_task_email_service_configs: Optional[List[Optional[dict]]] = None,
 ):
     """
     并行模式：所有任务同时提交，Semaphore 控制最大并发数
@@ -891,9 +988,12 @@ async def run_batch_parallel(
 
     async def _run_one(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
+        task_email_service_config = email_service_config
+        if per_task_email_service_configs and idx < len(per_task_email_service_configs):
+            task_email_service_config = per_task_email_service_configs[idx]
         async with semaphore:
             await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
+                uuid, email_service_type, proxy, task_email_service_config, email_service_id,
                 log_prefix=prefix, batch_id=batch_id,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
@@ -950,6 +1050,7 @@ async def run_batch_pipeline(
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
     registration_type: str = RoleTag.CHILD.value,
+    per_task_email_service_configs: Optional[List[Optional[dict]]] = None,
 ):
     """
     流水线模式：每隔 interval 秒启动一个新任务，Semaphore 限制最大并发数
@@ -962,9 +1063,12 @@ async def run_batch_pipeline(
     add_batch_log(f"[系统] 流水线模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
 
     async def _run_and_release(idx: int, uuid: str, pfx: str):
+        task_email_service_config = email_service_config
+        if per_task_email_service_configs and idx < len(per_task_email_service_configs):
+            task_email_service_config = per_task_email_service_configs[idx]
         try:
             await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
+                uuid, email_service_type, proxy, task_email_service_config, email_service_id,
                 log_prefix=pfx, batch_id=batch_id,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
@@ -1045,6 +1149,7 @@ async def run_batch_registration(
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
     registration_type: str = RoleTag.CHILD.value,
+    per_task_email_service_configs: Optional[List[Optional[dict]]] = None,
 ):
     """根据 mode 分发到并行或流水线执行"""
     if mode == "parallel":
@@ -1056,6 +1161,7 @@ async def run_batch_registration(
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
             auto_upload_new_api=auto_upload_new_api, new_api_service_ids=new_api_service_ids,
             registration_type=registration_type,
+            per_task_email_service_configs=per_task_email_service_configs,
         )
     else:
         await run_batch_pipeline(
@@ -1067,6 +1173,7 @@ async def run_batch_registration(
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
             auto_upload_new_api=auto_upload_new_api, new_api_service_ids=new_api_service_ids,
             registration_type=registration_type,
+            per_task_email_service_configs=per_task_email_service_configs,
         )
 
 
@@ -1401,6 +1508,165 @@ async def _start_outlook_batch_registration_internal(
     )
 
 
+async def _start_luckmail_batch_registration_internal(
+    request: LuckMailBatchRegistrationRequest,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> LuckMailBatchRegistrationResponse:
+    from ...database.models import EmailService as EmailServiceModel
+    from ...database.models import Account
+
+    if request.interval_min < 0 or request.interval_max < request.interval_min:
+        raise HTTPException(status_code=400, detail="间隔时间参数无效")
+    if not 1 <= request.concurrency <= 50:
+        raise HTTPException(status_code=400, detail="并发数必须在 1-50 之间")
+    if request.mode not in ("parallel", "pipeline"):
+        raise HTTPException(status_code=400, detail="模式必须为 parallel 或 pipeline")
+
+    with get_db() as db:
+        db_service = db.query(EmailServiceModel).filter(
+            EmailServiceModel.id == request.service_id,
+            EmailServiceModel.service_type == "luckmail",
+            EmailServiceModel.enabled == True,
+        ).first()
+        if not db_service:
+            raise HTTPException(status_code=404, detail="LuckMail 服务不存在或已禁用")
+        service_config = _normalize_email_service_config(EmailServiceType.LUCKMAIL, db_service.config, request.proxy)
+
+    try:
+        luckmail_service = EmailServiceFactory.create(EmailServiceType.LUCKMAIL, service_config)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"初始化 LuckMail 服务失败: {exc}")
+
+    selected_mailboxes: List[Dict[str, Any]] = []
+    if request.use_all_purchased:
+        try:
+            page = 1
+            seen_tokens: set[str] = set()
+            while True:
+                payload = await luckmail_service.list_purchased_mailboxes_async(page=page, page_size=100, user_disabled=0)
+                items_raw = payload.get("list") if isinstance(payload, dict) else []
+                items = list(items_raw or [])
+                if not items:
+                    break
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    token = str(item.get("token") or "").strip()
+                    email = str(item.get("email") or item.get("email_address") or "").strip().lower()
+                    if not token or not email or token in seen_tokens:
+                        continue
+                    seen_tokens.add(token)
+                    selected_mailboxes.append({
+                        "email": email,
+                        "token": token,
+                        "purchase_id": item.get("purchase_id") or item.get("id"),
+                    })
+                current_page_size = 100
+                if isinstance(payload, dict):
+                    try:
+                        current_page_size = int(payload.get("page_size") or 100)
+                    except Exception:
+                        current_page_size = 100
+                if len(items) < current_page_size:
+                    break
+                page += 1
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"LuckMail 加载全部已购邮箱失败: {exc}")
+    else:
+        seen_tokens: set[str] = set()
+        for mailbox in request.selected_mailboxes:
+            token = str(mailbox.token or "").strip()
+            email = str(mailbox.email or "").strip().lower()
+            if not token or not email or token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            selected_mailboxes.append({
+                "email": email,
+                "token": token,
+                "purchase_id": mailbox.purchase_id,
+            })
+
+    if not selected_mailboxes:
+        raise HTTPException(status_code=400, detail="请至少选择一个 LuckMail 已购邮箱")
+
+    actual_mailboxes: List[Dict[str, Any]] = []
+    skipped_count = 0
+    if request.skip_registered:
+        with get_db() as db:
+            for mailbox in selected_mailboxes:
+                existing_account = db.query(Account).filter(Account.email == mailbox["email"]).first()
+                if existing_account:
+                    skipped_count += 1
+                else:
+                    actual_mailboxes.append(mailbox)
+    else:
+        actual_mailboxes = selected_mailboxes
+
+    if not actual_mailboxes:
+        return LuckMailBatchRegistrationResponse(
+            batch_id="",
+            total=len(selected_mailboxes),
+            skipped=skipped_count,
+            to_register=0,
+            service_id=request.service_id,
+            selected_count=len(selected_mailboxes),
+        )
+
+    batch_id = str(uuid.uuid4())
+    task_uuids: List[str] = []
+    per_task_configs: List[dict] = []
+    with get_db() as db:
+        for mailbox in actual_mailboxes:
+            task_uuid = str(uuid.uuid4())
+            crud.create_registration_task(
+                db,
+                task_uuid=task_uuid,
+                proxy=request.proxy,
+                email_service_id=request.service_id,
+            )
+            task_uuids.append(task_uuid)
+            per_task_configs.append({
+                "selected_mailbox_token": mailbox["token"],
+                "selected_mailbox_email": mailbox["email"],
+                "selected_purchase_id": mailbox.get("purchase_id"),
+                "inbox_mode": "purchase",
+            })
+
+    _schedule_async_job(
+        background_tasks,
+        run_batch_registration,
+        batch_id,
+        task_uuids,
+        "luckmail",
+        request.proxy,
+        None,
+        request.service_id,
+        request.interval_min,
+        request.interval_max,
+        request.concurrency,
+        request.mode,
+        request.auto_upload_cpa,
+        request.cpa_service_ids,
+        request.auto_upload_sub2api,
+        request.sub2api_service_ids,
+        request.auto_upload_tm,
+        request.tm_service_ids,
+        request.auto_upload_new_api,
+        request.new_api_service_ids,
+        request.registration_type,
+        per_task_configs,
+    )
+
+    return LuckMailBatchRegistrationResponse(
+        batch_id=batch_id,
+        total=len(selected_mailboxes),
+        skipped=skipped_count,
+        to_register=len(actual_mailboxes),
+        service_id=request.service_id,
+        selected_count=len(selected_mailboxes),
+    )
+
+
 async def dispatch_registration_config(
     registration_config: Dict[str, Any],
     background_tasks: Optional[BackgroundTasks] = None,
@@ -1431,6 +1697,34 @@ async def dispatch_registration_config(
             new_api_service_ids=config.get('new_api_service_ids') or [],
         )
         response = await _start_outlook_batch_registration_internal(request, background_tasks)
+        return {
+            'kind': 'batch',
+            'batch_id': response.batch_id,
+            'payload': response.model_dump(),
+        }
+
+    if reg_mode == 'luckmail_batch':
+        request = LuckMailBatchRegistrationRequest(
+            service_id=int(config.get('email_service_id') or 0),
+            selected_mailboxes=config.get('selected_mailboxes') or [],
+            use_all_purchased=bool(config.get('use_all_purchased', False)),
+            skip_registered=bool(config.get('skip_registered', True)),
+            proxy=config.get('proxy'),
+            interval_min=int(config.get('interval_min') or 5),
+            interval_max=int(config.get('interval_max') or 30),
+            concurrency=int(config.get('concurrency') or 1),
+            mode=config.get('mode') or 'pipeline',
+            auto_upload_cpa=bool(config.get('auto_upload_cpa', False)),
+            cpa_service_ids=config.get('cpa_service_ids') or [],
+            auto_upload_sub2api=bool(config.get('auto_upload_sub2api', False)),
+            sub2api_service_ids=config.get('sub2api_service_ids') or [],
+            auto_upload_tm=bool(config.get('auto_upload_tm', False)),
+            tm_service_ids=config.get('tm_service_ids') or [],
+            auto_upload_new_api=bool(config.get('auto_upload_new_api', False)),
+            new_api_service_ids=config.get('new_api_service_ids') or [],
+            registration_type=config.get('registration_type') or RoleTag.CHILD.value,
+        )
+        response = await _start_luckmail_batch_registration_internal(request, background_tasks)
         return {
             'kind': 'batch',
             'batch_id': response.batch_id,
@@ -2024,6 +2318,52 @@ async def get_outlook_accounts_for_registration():
         )
 
 
+@router.get("/luckmail-purchases", response_model=LuckMailPurchasedMailboxListResponse)
+async def get_luckmail_purchases_for_registration(
+    service_id: int = Query(..., ge=1, description="LuckMail 邮箱服务 ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    project_id: Optional[int] = Query(None),
+    tag_id: Optional[int] = Query(None),
+    keyword: Optional[str] = Query(None),
+    user_disabled: int = Query(0),
+):
+    from ...database.models import EmailService as EmailServiceModel
+    from ...services.luckmail_mail import LuckMailService
+
+    with get_db() as db:
+        db_service = db.query(EmailServiceModel).filter(
+            EmailServiceModel.id == service_id,
+            EmailServiceModel.service_type == "luckmail",
+            EmailServiceModel.enabled == True,
+        ).first()
+
+        if not db_service:
+            raise HTTPException(status_code=404, detail="LuckMail 服务不存在或已禁用")
+
+        config = _normalize_email_service_config(EmailServiceType.LUCKMAIL, db_service.config)
+
+    try:
+        service = LuckMailService(config=config, name=db_service.name)
+        payload = await service.list_purchased_mailboxes_async(
+            page=page,
+            page_size=page_size,
+            project_id=project_id,
+            tag_id=tag_id,
+            keyword=keyword,
+            user_disabled=user_disabled,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LuckMail 已购邮箱加载失败: {exc}")
+
+    return LuckMailPurchasedMailboxListResponse(
+        total=int(payload.get("total") or 0),
+        page=int(payload.get("page") or page),
+        page_size=int(payload.get("page_size") or page_size),
+        mailboxes=[LuckMailPurchasedMailbox.model_validate(item) for item in (payload.get("list") or [])],
+    )
+
+
 async def run_outlook_batch_registration(
     batch_id: str,
     service_ids: List[int],
@@ -2106,6 +2446,14 @@ async def start_outlook_batch_registration(
     - interval_max: 最大间隔秒数
     """
     return await _start_outlook_batch_registration_internal(request, background_tasks)
+
+
+@router.post("/luckmail-batch", response_model=LuckMailBatchRegistrationResponse)
+async def start_luckmail_batch_registration(
+    request: LuckMailBatchRegistrationRequest,
+    background_tasks: BackgroundTasks,
+):
+    return await _start_luckmail_batch_registration_internal(request, background_tasks)
 
 
 @router.get("/outlook-batch/{batch_id}")
